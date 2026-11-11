@@ -11,6 +11,7 @@ import pytest
 from mutagen.id3 import ID3
 
 from downtify import downloader as downloader_mod
+from downtify import library_catalog
 from downtify.downloader import Downloader, NoAudioMatchError
 from tests.test_downloader_extended import _minimal_mp3
 
@@ -74,6 +75,61 @@ class _NoMetadataLookups:
 
     def cancel(self):
         pass
+
+
+def test_download_is_hidden_until_tagging_finishes(tmp_path, monkeypatch):
+    root = tmp_path / 'downloads'
+    d = Downloader(root, download_cover_art=False)
+    monkeypatch.setattr(
+        downloader_mod, '_MetadataLookups', lambda *a: _NoMetadataLookups()
+    )
+
+    def fetch(_video, target, basename, **_kwargs):
+        path = target / f'{basename}.mp3'
+        path.write_bytes(b'audio')
+        return path
+
+    def tag(path, *_args, **_kwargs):
+        ctx = library_catalog.LibraryContext(download_dir=root)
+        assert path.is_file()
+        assert library_catalog._scan_library_path_pairs(ctx) == []
+        return True
+
+    monkeypatch.setattr(d, 'fetch_audio', fetch)
+    monkeypatch.setattr(d, '_tag_file', tag)
+    stored = d._fetch_and_tag(dict(_SONG), 'video', None, None)
+    ctx = library_catalog.LibraryContext(download_dir=root)
+    assert [p[0] for p in library_catalog._scan_library_path_pairs(ctx)] == [
+        stored
+    ]
+
+
+def test_failed_processing_keeps_existing_track_and_cleans_staging(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / 'downloads'
+    d = Downloader(root, download_cover_art=False)
+    target, _, basename = d._target_location(dict(_SONG), None)
+    existing = target / f'{basename}.mp3'
+    existing.write_bytes(b'original')
+    monkeypatch.setattr(
+        downloader_mod, '_MetadataLookups', lambda *a: _NoMetadataLookups()
+    )
+
+    def fetch(_video, directory, name, **_kwargs):
+        path = directory / f'{name}.mp3'
+        path.write_bytes(b'replacement')
+        return path
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError('processing failed')
+
+    monkeypatch.setattr(d, 'fetch_audio', fetch)
+    monkeypatch.setattr(d, '_tag_file', fail)
+    with pytest.raises(RuntimeError, match='processing failed'):
+        d._fetch_and_tag(dict(_SONG), 'video', None, None)
+    assert existing.read_bytes() == b'original'
+    assert list(target.iterdir()) == [existing]
 
 
 def test_slskd_leave_in_place_tags_the_file_where_it_is(
@@ -140,6 +196,41 @@ def test_slskd_copy_mode_uses_main_destination_and_keeps_format(
     assert (target / 'Artist - Track.mp3').is_file()
     assert (target / 'cover.jpg').read_bytes() == b'IMG-BYTES'
     assert not source.exists()
+
+
+def test_slskd_copy_is_hidden_until_import_finishes(tmp_path, monkeypatch):
+    slskd_dir, source = _slskd_file(tmp_path)
+    root = tmp_path / 'downloads'
+    d = Downloader(
+        root,
+        audio_providers=['slskd'],
+        slskd_settings={
+            'enabled': True,
+            'leave_in_place': False,
+            'source_dir': str(slskd_dir),
+        },
+    )
+    monkeypatch.setattr(
+        downloader_mod, '_MetadataLookups', lambda *a: _NoMetadataLookups()
+    )
+    monkeypatch.setattr(
+        downloader_mod, '_valid_imported_audio', lambda path: True
+    )
+
+    def tag(path, *_args, **_kwargs):
+        assert path.is_file()
+        ctx = library_catalog.LibraryContext(download_dir=root)
+        assert library_catalog._scan_library_path_pairs(ctx) == []
+        return True
+
+    monkeypatch.setattr(d, '_tag_file', tag)
+    stored, _ = d._finalize_local_source(
+        dict(_SONG), source, 'slskd', None, None
+    )
+    ctx = library_catalog.LibraryContext(download_dir=root)
+    assert [p[0] for p in library_catalog._scan_library_path_pairs(ctx)] == [
+        stored
+    ]
 
 
 def test_concurrent_slskd_downloads_share_the_target_lock(
