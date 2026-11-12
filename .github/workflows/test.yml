@@ -76,5 +76,5 @@ jobs:
         uses: creyD/prettier_action@v4.6
         with:
           prettier_options: --write frontend/src/.
-          only_changed_pr: true
+          only_changed: true
           dry: true
