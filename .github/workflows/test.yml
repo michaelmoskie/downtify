@@ -68,8 +68,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
 
-      - name: Prettify code
+      - name: Check Prettier formatting
         uses: creyD/prettier_action@v4.6
         with:
-          prettier_options: --write frontend/src/.
+          prettier_options: --check frontend/src/.
+          only_changed: true
+          dry: true
