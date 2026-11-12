@@ -75,6 +75,6 @@ jobs:
       - name: Check Prettier formatting
         uses: creyD/prettier_action@v4.6
         with:
-          prettier_options: --check frontend/src/.
-          only_changed: true
+          prettier_options: --write frontend/src/.
+          only_changed_pr: true
           dry: true
