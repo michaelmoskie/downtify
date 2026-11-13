@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import shutil
+import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -55,6 +56,7 @@ from .download_log import (
 from .download_policy import DownloadPolicyBlocked
 from .file_naming import sanitize_file_name
 from .itunes import fetch_genre as _fetch_itunes_genre
+from .library_catalog import UPGRADE_STAGING_MARKER
 from .library_paths import library_stored_path, slskd_dir_from_downloader
 from .m3u import sanitize_playlist_name
 from .providers import (
@@ -1210,6 +1212,7 @@ class Downloader:
         found: _LookupResults,
         *,
         save_album_cover: bool = True,
+        lyrics_sidecar: Optional[Path] = None,
     ) -> bool:
         """Embed metadata, album cover.jpg and lyrics into ``final_path``."""
 
@@ -1239,7 +1242,12 @@ class Downloader:
 
         if found.lyrics is not None:
             try:
-                embed_lyrics(final_path, found.lyrics)
+                if lyrics_sidecar is None:
+                    embed_lyrics(final_path, found.lyrics)
+                else:
+                    embed_lyrics(
+                        final_path, found.lyrics, sidecar=lyrics_sidecar
+                    )
             except Exception:
                 succeeded = False
                 logger.exception('Failed to embed lyrics into {}', final_path)
@@ -1329,7 +1337,6 @@ class Downloader:
             return stored, None
 
         copied_from: Optional[Path] = None
-        cleanup_source: Optional[Path] = None
         lookups = _MetadataLookups(self, song)
         try:
             if provider == 'slskd' and self.slskd_settings.get(
@@ -1349,47 +1356,49 @@ class Downloader:
                 )
                 suffix = source_path.suffix or f'.{self.audio_format}'
                 final_path = target_dir / f'{basename}{suffix}'
-                if source_path.resolve() != final_path.resolve():
-                    shutil.copy2(source_path, final_path)
-                    copied_from = source_path.resolve()
-                    if provider == 'slskd':
-                        cleanup_source = source_path
                 stored = f'{rel_prefix}{final_path.name}'
                 in_place = False
             found = lookups.collect()
         finally:
             lookups.cancel()
 
-        # Never drop a cover.jpg into slskd's own folders.
-        tagged = self._tag_file(
-            final_path,
-            target_dir,
-            song,
-            found,
-            save_album_cover=not in_place,
-        )
-        if cleanup_source is not None:
-            if not tagged:
-                logger.warning(
-                    'slskd: retaining source because tagging failed '
-                    'source={!r} destination={!r}',
-                    cleanup_source,
-                    final_path,
+        if not in_place and source_path.resolve() != final_path.resolve():
+            with tempfile.TemporaryDirectory(
+                prefix='downtify-', dir=target_dir
+            ) as stage:
+                staged = (
+                    Path(stage)
+                    / f'{final_path.stem}{UPGRADE_STAGING_MARKER}{final_path.suffix}'
                 )
-                raise RuntimeError(
-                    'Could not tag imported slskd file; source retained'
+                shutil.copy2(source_path, staged)
+                tagged = self._tag_file(
+                    staged,
+                    target_dir,
+                    song,
+                    found,
+                    lyrics_sidecar=final_path.with_suffix('.lrc'),
                 )
-            if not _valid_imported_audio(final_path):
-                logger.warning(
-                    'slskd: retaining source because imported file failed '
-                    'audio verification source={!r} destination={!r}',
-                    cleanup_source,
-                    final_path,
-                )
-                raise RuntimeError(
-                    'Imported slskd file failed verification; source retained'
-                )
-            self._remove_slskd_source_after_import(cleanup_source, final_path)
+                if provider == 'slskd' and not tagged:
+                    raise RuntimeError(
+                        'Could not tag imported slskd file; source retained'
+                    )
+                if provider == 'slskd' and not _valid_imported_audio(staged):
+                    raise RuntimeError(
+                        'Imported slskd file failed verification; source retained'
+                    )
+                os.replace(staged, final_path)
+            copied_from = source_path.resolve()
+            if provider == 'slskd':
+                self._remove_slskd_source_after_import(source_path, final_path)
+        else:
+            # Never drop a cover.jpg into slskd's own folders.
+            self._tag_file(
+                final_path,
+                target_dir,
+                song,
+                found,
+                save_album_cover=not in_place,
+            )
         _report(progress_cb, 100.0, 'Done', provider)
         return stored, copied_from
 
@@ -1579,22 +1588,33 @@ class Downloader:
 
         # Genre, cover art and lyrics are looked up while yt-dlp downloads,
         # instead of one after another once it's done.
-        lookups = _MetadataLookups(self, song)
-        try:
-            final_path = self.fetch_audio(
-                video_id,
-                target_dir,
-                basename,
-                song=song,
-                progress_cb=progress_cb,
-                provider=provider,
-            )
-            found = lookups.collect()
-        finally:
-            # A failed download shouldn't wait on lookups nobody will use.
-            lookups.cancel()
+        with tempfile.TemporaryDirectory(
+            prefix='downtify-', dir=target_dir
+        ) as stage:
+            lookups = _MetadataLookups(self, song)
+            try:
+                staged_path = self.fetch_audio(
+                    video_id,
+                    Path(stage),
+                    basename + UPGRADE_STAGING_MARKER,
+                    song=song,
+                    progress_cb=progress_cb,
+                    provider=provider,
+                )
+                found = lookups.collect()
+            finally:
+                # A failed download shouldn't wait on lookups nobody will use.
+                lookups.cancel()
 
-        self._tag_file(final_path, target_dir, song, found)
+            final_path = target_dir / f'{basename}{staged_path.suffix}'
+            self._tag_file(
+                staged_path,
+                target_dir,
+                song,
+                found,
+                lyrics_sidecar=final_path.with_suffix('.lrc'),
+            )
+            os.replace(staged_path, final_path)
         _report(progress_cb, 100.0, 'Done', provider)
         return f'{rel_prefix}{final_path.name}'
 
